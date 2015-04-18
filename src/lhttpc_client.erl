@@ -27,7 +27,7 @@
 
 %%------------------------------------------------------------------------------
 %%% @private
-%%% @author Oscar Hellström <oscar@hellstrom.st>
+%%% @author Oscar Hellstrom <oscar@hellstrom.st>
 %%% @doc This module implements the HTTP request handling. This should normally
 %%% not be called directly since it should be spawned by the lhttpc module.
 %%% @end
@@ -46,6 +46,12 @@
         host :: string(),
         port = 80 :: port_num(),
         ssl = false :: boolean(),
+        measure_time,
+        created_at,
+        allocated_at,
+        connected_at,
+        send_request_at,
+        headers_at,
         method :: string(),
         request :: iolist(),
         request_headers :: headers(),
@@ -92,13 +98,15 @@ request(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
     Result = try
         execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options)
     catch
-        Reason ->
-            {response, self(), {error, Reason}};
+        % Reason ->
+        %     {response, self(), {error, Reason}};
         error:closed ->
             {response, self(), {error, connection_closed}};
-        error:Reason ->
+        throw:Reason ->
+            {response, self(), {error, Reason}};
+        Class:Reason ->
             Stack = erlang:get_stacktrace(),
-            {response, self(), {error, {Reason, Stack}}}
+            {response, self(), {error, {Class, Reason, Stack}}}
     end,
     case Result of
         {response, _, {ok, {no_return, _}}} -> ok;
@@ -120,6 +128,11 @@ request(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
 %% @end
 %%------------------------------------------------------------------------------
 execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
+    MeasureTime = proplists:get_bool(measure_time, Options),
+    T1 = case MeasureTime of
+        true -> os:timestamp();
+        _ -> undefined
+    end,
     UploadWindowSize = proplists:get_value(partial_upload, Options),
     PartialUpload = proplists:is_defined(partial_upload, Options),
     PartialDownload = proplists:is_defined(partial_download, Options),
@@ -141,11 +154,20 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
     Pool = proplists:get_value(pool, Options, whereis(lhttpc_manager)),
     %% Get a socket for the pool or exit
     %Socket = lhttpc_manager:ensure_call(Pool, SocketRequest, Options),
+    put(status, allocating_socket),
     Socket = lhttpc_manager:ensure_call(Pool, self(), Host, Port, Ssl, Options),
+    put(status, allocated_socket),
+    T2 = case MeasureTime of
+        true -> os:timestamp();
+        _ -> undefined
+    end,
     State = #client_state{
         host = Host,
         port = Port,
         ssl = Ssl,
+        measure_time = MeasureTime,
+        created_at = T1,
+        allocated_at = T2,
         method = NormalizedMethod,
         request = Request,
         requester = From,
@@ -167,6 +189,7 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
         proxy_setup = (Socket =/= undefined),
         proxy_ssl_options = proplists:get_value(proxy_ssl_options, Options, [])
     },
+    put(status, sending_request),
     Response = case send_request(State) of
         {R, undefined} ->
             {ok, R};
@@ -194,7 +217,7 @@ send_request(#client_state{attempts = 0}) ->
     % Don't try again if the number of allowed attempts is 0.
     throw(connection_closed);
 %we need a socket.
-send_request(#client_state{socket = undefined} = State) ->
+send_request(#client_state{socket = undefined, measure_time = MeasureTime} = State) ->
     {Host, Port, Ssl} = request_first_destination(State),
     Timeout = State#client_state.connect_timeout,
     ConnectOptions0 = State#client_state.connect_options,
@@ -207,9 +230,15 @@ send_request(#client_state{socket = undefined} = State) ->
             ConnectOptions0
     end,
     SocketOptions = [binary, {packet, http}, {active, false} | ConnectOptions],
+    put(status, connecting),
     try lhttpc_sock:connect(Host, Port, SocketOptions, Timeout, Ssl) of
         {ok, Socket} ->
-            send_request(State#client_state{socket = Socket});
+            T3 = case MeasureTime of
+                true -> os:timestamp();
+                _ -> undefined
+            end,
+            put(status, connected),
+            send_request(State#client_state{socket = Socket, connected_at = T3});
         {error, etimedout} ->
             % TCP stack decided to give up
             throw(connect_timeout);
@@ -267,17 +296,28 @@ send_request(#client_state{proxy = #lhttpc_url{}, proxy_setup = false} = State) 
             lhttpc_sock:close(Socket, Ssl),
             erlang:error(Reason)
     end;
-send_request(State) ->
+send_request(#client_state{measure_time = MeasureTime, connected_at = T2} = State) ->
 %already have socket
     Socket = State#client_state.socket,
     Ssl = State#client_state.ssl,
     Request = State#client_state.request,
+    put(status, sending_request),
     case lhttpc_sock:send(Socket, Request, Ssl) of
         ok ->
+            State1 = case MeasureTime of
+                true when T2 == undefined ->
+                    Now = os:timestamp(),
+                    State#client_state{send_request_at = Now, connected_at = Now};
+                true ->
+                    State#client_state{send_request_at = os:timestamp()};
+                _ -> 
+                    State
+            end,
+            put(status, sent_request),
             if
                 % {partial_upload, WindowSize} is used.
-                State#client_state.partial_upload     -> partial_upload(State);
-                not State#client_state.partial_upload -> read_response(State)
+                State#client_state.partial_upload     -> partial_upload(State1);
+                not State#client_state.partial_upload -> read_response(State1)
             end;
         {error, closed} ->
             lhttpc_sock:close(Socket, Ssl),
@@ -444,7 +484,12 @@ read_response(State, Vsn, {StatusCode, _} = Status, Hdrs) ->
             read_response(State, nil, {nil, nil}, []);
         {ok, http_eoh} ->
             lhttpc_sock:setopts(Socket, [{packet, raw}], Ssl),
-            Response = handle_response_body(State, Vsn, Status, Hdrs),
+            T4 = case State#client_state.measure_time of
+                true -> os:timestamp();
+                _ -> undefined
+            end,
+            put(status, receiving_body),
+            Response = handle_response_body(State#client_state{headers_at = T4}, Vsn, Status, Hdrs),
             NewHdrs = element(2, Response),
             ReqHdrs = State#client_state.request_headers,
             NewSocket = maybe_close_socket(Socket, Ssl, Vsn, ReqHdrs, NewHdrs),
@@ -485,14 +530,48 @@ handle_response_body(#client_state{partial_download = false} = State, Vsn,
                           true  -> read_body(Vsn, Hdrs, Ssl, Socket, body_type(Hdrs));
                           false -> {<<>>, Hdrs}
                       end,
-    {Status, NewHdrs, Body};
+    TimeHeaders = case State#client_state.measure_time of
+        true ->
+            T0 = State#client_state.created_at,
+            T1 = State#client_state.allocated_at,
+            T2 = State#client_state.connected_at,
+            T3 = State#client_state.send_request_at,
+            T4 = State#client_state.headers_at,
+            T5 = os:timestamp(),
+            [{allocate_time,timer:now_diff(T1,T0)},
+            {connect_time,timer:now_diff(T2,T1)},
+            {send_time,timer:now_diff(T3,T2)},
+            {headers_time,timer:now_diff(T4,T3)},
+            {recv_body_time,timer:now_diff(T5,T4)}];
+        _ ->
+            []
+    end,
+    put(status, received_body),
+    {Status, TimeHeaders ++ NewHdrs, Body};
 handle_response_body(#client_state{partial_download = true} = State, Vsn,
         Status, Hdrs) ->
 %when {partial_download, PartialDownloadOptions} option is used.
     Method = State#client_state.method,
     case has_body(Method, element(1, Status), Hdrs) of
         true ->
-            Response = {ok, {Status, Hdrs, self()}},
+            TimeHeaders = case State#client_state.measure_time of
+                true ->
+                    T0 = State#client_state.created_at,
+                    T1 = State#client_state.allocated_at,
+                    T2 = State#client_state.connected_at,
+                    T3 = State#client_state.send_request_at,
+                    T4 = State#client_state.headers_at,
+                    T5 = os:timestamp(),
+                    [{allocate_time,timer:now_diff(T1,T0)},
+                    {connect_time,timer:now_diff(T2,T1)},
+                    {send_time,timer:now_diff(T3,T2)},
+                    {headers_time,timer:now_diff(T4,T3)},
+                    {recv_body_time,timer:now_diff(T5,T4)}];
+                _ ->
+                    []
+            end,
+
+            Response = {ok, {Status, TimeHeaders ++ Hdrs, self()}},
             State#client_state.requester ! {response, self(), Response},
             MonRef = erlang:monitor(process, State#client_state.requester),
             Res = read_partial_body(State, Vsn, Hdrs, body_type(Hdrs)),
@@ -538,17 +617,18 @@ has_body(_, _, _) ->
 %%------------------------------------------------------------------------------
 -spec body_type(headers()) -> 'chunked' | 'infinite' | {fixed_length, integer()}.
 body_type(Hdrs) ->
-    case lhttpc_lib:header_value("content-length", Hdrs) of
-        undefined ->
-            TransferEncoding = string:to_lower(
-                lhttpc_lib:header_value("transfer-encoding", Hdrs, "undefined")
-            ),
-            case TransferEncoding of
-                "chunked" -> chunked;
-                _         -> infinite
-            end;
-        ContentLength ->
-            {fixed_length, list_to_integer(ContentLength)}
+    TransferEncoding = string:to_lower(
+        lhttpc_lib:header_value("transfer-encoding", Hdrs, "undefined")
+    ),
+    case TransferEncoding of
+        "chunked" -> chunked;
+        _ ->
+            case lhttpc_lib:header_value("content-length", Hdrs) of
+                undefined -> 
+                    infinite;
+                ContentLength ->
+                    {fixed_length, list_to_integer(ContentLength)}
+            end
     end.
 
 %%------------------------------------------------------------------------------

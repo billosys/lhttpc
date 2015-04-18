@@ -26,7 +26,7 @@
 %%% ----------------------------------------------------------------------------
 
 %%------------------------------------------------------------------------------
-%%% @author Oscar Hellström <oscar@hellstrom.st>
+%%% @author Oscar Hellstr0m <oscar@hellstrom.st>
 %%% @doc Main interface to the lightweight http client.
 %%% See {@link request/4}, {@link request/5} and {@link request/6} functions.
 %%% @end
@@ -183,7 +183,7 @@ delete_pool(PoolName) when is_atom(PoolName) ->
 %% @see request/9
 %% @end
 %%------------------------------------------------------------------------------
--spec request(string(), method(), headers(), pos_timeout()) -> result().
+-spec request(string() | binary(), method(), headers(), pos_timeout()) -> result().
 request(URL, Method, Hdrs, Timeout) ->
     request(URL, Method, Hdrs, [], Timeout, []).
 
@@ -208,7 +208,7 @@ request(URL, Method, Hdrs, Timeout) ->
 %% @see request/9
 %% @end
 %%------------------------------------------------------------------------------
--spec request(string(), method(), headers(), iodata(), pos_timeout()) -> result().
+-spec request(string() | binary(), method(), headers(), iodata(), pos_timeout()) -> result().
 request(URL, Method, Hdrs, Body, Timeout) ->
     request(URL, Method, Hdrs, Body, Timeout, []).
 
@@ -257,9 +257,10 @@ request(URL, Method, Hdrs, Body, Timeout) ->
 %% @see request/9
 %% @end
 %%------------------------------------------------------------------------------
--spec request(string(), method(), headers(), iodata(),
+-spec request(string() | binary(), method(), headers(), iodata(),
               pos_timeout(), options()) -> result().
-request(URL, Method, Hdrs, Body, Timeout, Options) ->
+request(URL, Method, Hdrs0, Body, Timeout, Options) ->
+    Hdrs = [{to_l(K),to_l(V)} || {K,V} <- Hdrs0],
     #lhttpc_url{
          host = Host,
          port = Port,
@@ -267,7 +268,7 @@ request(URL, Method, Hdrs, Body, Timeout, Options) ->
          is_ssl = Ssl,
          user = User,
          password = Passwd
-        } = lhttpc_lib:parse_url(URL),
+        } = lhttpc_lib:parse_url(to_l(URL)),
     Headers = case User of
         "" ->
             Hdrs;
@@ -276,6 +277,10 @@ request(URL, Method, Hdrs, Body, Timeout, Options) ->
             lists:keystore("Authorization", 1, Hdrs, {"Authorization", Auth})
     end,
     request(Host, Port, Ssl, Path, Method, Headers, Body, Timeout, Options).
+
+to_l(Bin) when is_binary(Bin) -> binary_to_list(Bin);
+to_l(List) when is_list(List) -> List;
+to_l(Atom) when is_atom(Atom) -> atom_to_list(Atom).
 
 %%------------------------------------------------------------------------------
 %% @spec (Host, Port, Ssl, Path, Method, Hdrs, RequestBody, Timeout, Options) ->
@@ -429,8 +434,15 @@ request(URL, Method, Hdrs, Body, Timeout, Options) ->
 request(Host, Port, Ssl, Path, Method, Hdrs, Body, Timeout, Options) ->
     verify_options(Options),
     Args = [self(), Host, Port, Ssl, Path, Method, Hdrs, Body, Options],
-    Pid = spawn_link(lhttpc_client, request, Args),
+    MeasureTime = proplists:get_bool(measure_time, Options),
+    T1 = os:timestamp(),
+    Pid = proc_lib:spawn_link(lhttpc_client, request, Args),
     receive
+        {response, Pid, {error, {Error, Stacktrace}}} ->
+            {error, {Error, Stacktrace}};
+        {response, Pid, {ok, {RStatus, RHeaders, RBody}}} when MeasureTime ->
+            T2 = os:timestamp(),
+            {ok, {RStatus, [{total_time,timer:now_diff(T2,T1)}|RHeaders], RBody}};
         {response, Pid, R} ->
             R;
         {'EXIT', Pid, Reason} ->
@@ -637,12 +649,18 @@ read_response(Pid, Timeout) ->
 kill_client(Pid) ->
     Monitor = erlang:monitor(process, Pid),
     unlink(Pid), % or we'll kill ourself :O
+    Status = case process_info(Pid, dictionary) of
+        {dictionary, Dict} -> proplists:get_value(status, Dict);
+        _ -> noproc
+    end,
     exit(Pid, timeout),
     receive
         {response, Pid, R} ->
             erlang:demonitor(Monitor, [flush]),
             R;
-        {'DOWN', _, process, Pid, Reason}  ->
+        {'DOWN', _, process, Pid, Reason} when Status =/= noproc ->
+            {error, {Reason, {status,Status}}};
+        {'DOWN', _, process, Pid, Reason} ->
             {error, Reason}
     end.
 
@@ -684,6 +702,8 @@ verify_options([{pool_connection_timeout, Size} | Options])
 verify_options([{pool_max_size, Size} | Options])
         when is_integer(Size) orelse
              Size =:= infinity->
+    verify_options(Options);
+verify_options([measure_time | Options]) ->
     verify_options(Options);
 verify_options([Option | _Rest]) ->
     erlang:error({bad_option, Option});
