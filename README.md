@@ -1,11 +1,13 @@
 # lhttpc
 
-## ESL Notice
+## Notices
+
+### ESL 
 
 This project is no longer supported by Erlang Solutions. Instead, they recommend using [shotgun](https://github.com/inaka/shotgun) or [fusco](https://github.com/esl/fusco).
 
 
-## BilloSystems Noice
+### BilloSystems Notice
 
 We actually really like lhttpc and are happy with it. We'll maintain a repo for it until we run into limitations
 (we haven't so far).
